@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+*.h5
+*.hdf5
+*.mat
+*.nc
+*.npz
+.venv/
+output/
+checkpoints/
+wandb/
+*.mp4

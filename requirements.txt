@@ -1,0 +1,10 @@
+numpy
+h5py
+jax
+jaxlib
+scipy
+matplotlib
+dedalus>=3.0.2
+equinox
+optax
+wandb
