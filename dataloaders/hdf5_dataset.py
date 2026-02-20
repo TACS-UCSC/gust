@@ -16,9 +16,10 @@ import jax.numpy as jnp
 class PrefetchIterator:
     """Wraps an iterator to prefetch batches in a background thread."""
 
-    def __init__(self, iterator, prefetch_count=2):
+    def __init__(self, iterator, prefetch_count=2, sharding=None):
         self.iterator = iterator
         self.prefetch_count = prefetch_count
+        self.sharding = sharding
         self.queue = queue.Queue(maxsize=prefetch_count)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._prefetch_loop, daemon=True)
@@ -29,7 +30,10 @@ class PrefetchIterator:
             for item in self.iterator:
                 if self.stop_event.is_set():
                     break
-                item = jax.device_put(item)
+                if self.sharding is not None:
+                    item = jax.device_put(item, self.sharding)
+                else:
+                    item = jax.device_put(item)
                 self.queue.put(item)
         except Exception as e:
             self.queue.put(e)
@@ -68,12 +72,15 @@ class HDF5Dataset:
     """
 
     def __init__(self, data_path, fields=None, normalize=False,
-                 batch_size=16, shuffle=True, seed=42, prefetch=2):
+                 batch_size=16, shuffle=True, seed=42, prefetch=2,
+                 sharding=None, drop_last=False):
         self.data_path = data_path
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
         self.prefetch = prefetch
+        self.sharding = sharding
+        self.drop_last = drop_last
         self._rng = np.random.RandomState(seed)
 
         # Open file to read metadata
@@ -165,6 +172,8 @@ class HDF5Dataset:
 
     def __len__(self):
         """Number of batches per epoch."""
+        if self.drop_last:
+            return self._n_samples // self.batch_size
         return (self._n_samples + self.batch_size - 1) // self.batch_size
 
     def _read_batch(self, f, indices):
@@ -203,6 +212,8 @@ class HDF5Dataset:
         with h5py.File(self.data_path, 'r') as f:
             for start in range(0, self._n_samples, self.batch_size):
                 batch_idx = indices[start:start + self.batch_size]
+                if self.drop_last and len(batch_idx) < self.batch_size:
+                    break
                 # Sort indices for sequential HDF5 access (much faster)
                 sorted_order = np.argsort(batch_idx)
                 sorted_idx = batch_idx[sorted_order]
@@ -216,7 +227,7 @@ class HDF5Dataset:
         """Yields (B, C, H, W) jnp arrays."""
         gen = self._batch_generator()
         if self.prefetch > 0:
-            return PrefetchIterator(gen, prefetch_count=self.prefetch)
+            return PrefetchIterator(gen, prefetch_count=self.prefetch, sharding=self.sharding)
         return gen
 
     @property

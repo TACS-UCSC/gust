@@ -502,7 +502,8 @@ class MultiScaleQuantizer2d(eqx.Module):
 
         # Find nearest codebook vectors
         codebook_indices = jnp.argmin(distance, axis=-1)  # [H*W]
-        z_q = codebook[codebook_indices]  # [H*W, D]
+        # Use one-hot matmul instead of fancy indexing for multi-device sharding
+        z_q = jax.nn.one_hot(codebook_indices, codebook.shape[0]) @ codebook  # [H*W, D]
 
         # Straight-through estimator
         z_q = flatten + jax.lax.stop_gradient(z_q - flatten)
@@ -667,7 +668,7 @@ class VQVAE2d(eqx.Module):
 
         for k, indices in enumerate(indices_list):
             H, W = indices.shape
-            z_q_k = self.quantizer.codebooks[k][indices.flatten()]  # [H*W, D]
+            z_q_k = jax.nn.one_hot(indices.flatten(), self.quantizer.K) @ self.quantizer.codebooks[k]  # [H*W, D]
             z_q_k = jnp.reshape(z_q_k, (H, W, D))  # [H, W, D]
             z_q_k = jnp.transpose(z_q_k, (2, 0, 1))  # [D, H, W]
             z_q_k_up = jax.image.resize(z_q_k, (D, target_h, target_w), method="nearest")

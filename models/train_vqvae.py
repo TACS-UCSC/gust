@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import equinox as eqx
 import argparse
@@ -107,6 +108,20 @@ def main():
     # Set random seed
     key = jax.random.PRNGKey(args.seed)
 
+    # Set up device mesh for data parallelism
+    num_devices = jax.device_count()
+    mesh = jax.make_mesh((num_devices,), ("batch",))
+    jax.sharding.set_mesh(mesh)
+    print(f"Using {num_devices} device(s)")
+
+    if args.batch_size % num_devices != 0:
+        raise ValueError(
+            f"Batch size ({args.batch_size}) must be divisible by "
+            f"number of devices ({num_devices})"
+        )
+
+    data_sharding = NamedSharding(mesh, P("batch", None, None, None))
+
     # Load data
     print("Loading turbulence data...")
     dataset = HDF5Dataset(
@@ -117,6 +132,8 @@ def main():
         seed=args.seed,
         normalize=args.normalize,
         prefetch=2,
+        sharding=data_sharding,
+        drop_last=True,
     )
     C, H, W = dataset.sample_shape
     print(f"Dataset: {dataset.n_samples} samples, shape ({C}, {H}, {W})")
@@ -208,6 +225,7 @@ def main():
             "use_attention": use_attention,
             "use_norm": use_norm,
             "attention_heads": args.attention_heads,
+            "num_devices": num_devices,
         }
         wandb.init(
             project=args.wandb_project,
@@ -292,6 +310,7 @@ def main():
 
     # Also save final weights to wandb run directory
     if WANDB_AVAILABLE and wandb.run is not None:
+        os.makedirs(wandb.run.dir, exist_ok=True)
         wandb_checkpoint_path = os.path.join(wandb.run.dir, "vqvae_final.eqx")
         eqx.tree_serialise_leaves(wandb_checkpoint_path, model)
         print(f"Saved final weights to {wandb_checkpoint_path}")
