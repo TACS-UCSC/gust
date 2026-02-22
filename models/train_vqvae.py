@@ -58,6 +58,10 @@ def parse_args():
                         help="Disable GroupNorm in ResBlocks")
     parser.add_argument("--attention_heads", type=int, default=8,
                         help="Number of attention heads")
+    parser.add_argument("--sample_start", type=int, default=0,
+                        help="First sample index to use (default: 0)")
+    parser.add_argument("--sample_stop", type=int, default=None,
+                        help="Stop sample index (exclusive, default: all)")
     return parser.parse_args()
 
 
@@ -94,12 +98,18 @@ def plot_codebook_usage(indices, vocab_size):
     return fig
 
 
-def save_checkpoint(model, opt_state, epoch, checkpoint_dir):
-    """Save model checkpoint."""
+def save_checkpoint(model, opt_state, epoch, checkpoint_dir, wandb_dir=None):
+    """Save model checkpoint to checkpoint_dir and optionally to wandb dir."""
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"vqvae_epoch_{epoch}.eqx")
     eqx.tree_serialise_leaves(checkpoint_path, model)
     print(f"Saved checkpoint to {checkpoint_path}")
+
+    if wandb_dir is not None:
+        os.makedirs(wandb_dir, exist_ok=True)
+        wandb_path = os.path.join(wandb_dir, f"vqvae_epoch_{epoch}.eqx")
+        eqx.tree_serialise_leaves(wandb_path, model)
+        print(f"Saved checkpoint to {wandb_path}")
 
 
 def main():
@@ -134,6 +144,8 @@ def main():
         prefetch=2,
         sharding=data_sharding,
         drop_last=True,
+        sample_start=args.sample_start,
+        sample_stop=args.sample_stop,
     )
     C, H, W = dataset.sample_shape
     print(f"Dataset: {dataset.n_samples} samples, shape ({C}, {H}, {W})")
@@ -203,35 +215,53 @@ def main():
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+    # Build config
+    config = {
+        "data_path": args.data_path,
+        "sample_start": args.sample_start,
+        "sample_stop": args.sample_stop,
+        "n_samples": dataset.n_samples,
+        "hidden_dim": args.hidden_dim,
+        "codebook_dim": args.codebook_dim,
+        "vocab_size": args.vocab_size,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "commitment_weight": args.commitment_weight,
+        "decay": args.decay,
+        "epochs": args.epochs,
+        "seed": args.seed,
+        "normalize": args.normalize,
+        "scales": scales,
+        "total_tokens": total_tokens,
+        "base_channels": args.base_channels,
+        "channel_mult": channel_mult,
+        "num_res_blocks": args.num_res_blocks,
+        "use_attention": use_attention,
+        "use_norm": use_norm,
+        "attention_heads": args.attention_heads,
+        "num_devices": num_devices,
+    }
+
     # Initialize wandb
     if WANDB_AVAILABLE:
-        config = {
-            "hidden_dim": args.hidden_dim,
-            "codebook_dim": args.codebook_dim,
-            "vocab_size": args.vocab_size,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "commitment_weight": args.commitment_weight,
-            "decay": args.decay,
-            "epochs": args.epochs,
-            "seed": args.seed,
-            "normalize": args.normalize,
-            "scales": scales,
-            "total_tokens": total_tokens,
-            # Capacity hyperparameters
-            "base_channels": args.base_channels,
-            "channel_mult": channel_mult,
-            "num_res_blocks": args.num_res_blocks,
-            "use_attention": use_attention,
-            "use_norm": use_norm,
-            "attention_heads": args.attention_heads,
-            "num_devices": num_devices,
-        }
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_name,
             config=config
         )
+
+    # Save config to checkpoint_dir and wandb run dir
+    def write_config(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            for k, v in sorted(config.items()):
+                f.write(f"{k}: {v}\n")
+        print(f"Saved config to {path}")
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    write_config(os.path.join(args.checkpoint_dir, "config.txt"))
+    if WANDB_AVAILABLE and wandb.run is not None:
+        write_config(os.path.join(wandb.run.dir, "config.txt"))
 
     # Training loop
     global_step = 0
@@ -302,18 +332,15 @@ def main():
             plt.close(usage_fig)
 
         # Save checkpoint
+        wandb_dir = wandb.run.dir if (WANDB_AVAILABLE and wandb.run is not None) else None
         if (epoch + 1) % args.save_every == 0:
-            save_checkpoint(model, opt_state, epoch + 1, args.checkpoint_dir)
+            save_checkpoint(model, opt_state, epoch + 1, args.checkpoint_dir, wandb_dir)
 
     # Save final checkpoint
-    save_checkpoint(model, opt_state, args.epochs, args.checkpoint_dir)
+    wandb_dir = wandb.run.dir if (WANDB_AVAILABLE and wandb.run is not None) else None
+    save_checkpoint(model, opt_state, args.epochs, args.checkpoint_dir, wandb_dir)
 
-    # Also save final weights to wandb run directory
     if WANDB_AVAILABLE and wandb.run is not None:
-        os.makedirs(wandb.run.dir, exist_ok=True)
-        wandb_checkpoint_path = os.path.join(wandb.run.dir, "vqvae_final.eqx")
-        eqx.tree_serialise_leaves(wandb_checkpoint_path, model)
-        print(f"Saved final weights to {wandb_checkpoint_path}")
         wandb.finish()
     print("\nTraining complete!")
 

@@ -73,7 +73,8 @@ class HDF5Dataset:
 
     def __init__(self, data_path, fields=None, normalize=False,
                  batch_size=16, shuffle=True, seed=42, prefetch=2,
-                 sharding=None, drop_last=False):
+                 sharding=None, drop_last=False,
+                 sample_start=0, sample_stop=None):
         self.data_path = data_path
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -100,13 +101,20 @@ class HDF5Dataset:
 
             # All fields must have same n_samples and spatial dims
             first = shapes[self.fields[0]]
-            self._n_samples = first[0]
+            total_samples = first[0]
             self._spatial_shape = first[1:3]  # (H, W)
             for name, shape in shapes.items():
-                if shape[0] != self._n_samples:
-                    raise ValueError(f"Field '{name}' has {shape[0]} samples, expected {self._n_samples}")
+                if shape[0] != total_samples:
+                    raise ValueError(f"Field '{name}' has {shape[0]} samples, expected {total_samples}")
                 if shape[1:3] != self._spatial_shape:
                     raise ValueError(f"Field '{name}' spatial shape {shape[1:3]} != {self._spatial_shape}")
+
+        # Apply sample range
+        if sample_stop is None:
+            sample_stop = total_samples
+        self._sample_start = max(0, sample_start)
+        self._sample_stop = min(sample_stop, total_samples)
+        self._n_samples = self._sample_stop - self._sample_start
 
         # Count channels
         self._n_channels = 0
@@ -128,7 +136,7 @@ class HDF5Dataset:
     def _compute_norm_stats(self, max_samples=1000):
         """Compute per-channel mean/std from a subsample."""
         n = min(max_samples, self._n_samples)
-        indices = np.linspace(0, self._n_samples - 1, n, dtype=int)
+        indices = np.linspace(self._sample_start, self._sample_stop - 1, n, dtype=int)
 
         channel_data = [[] for _ in range(self._n_channels)]
         with h5py.File(self.data_path, 'r') as f:
@@ -147,7 +155,7 @@ class HDF5Dataset:
         channel_counts = np.zeros(self._n_channels, dtype=np.int64)
 
         with h5py.File(self.data_path, 'r') as f:
-            for idx in np.linspace(0, self._n_samples - 1, n, dtype=int):
+            for idx in np.linspace(self._sample_start, self._sample_stop - 1, n, dtype=int):
                 c_offset = 0
                 for name in self.fields:
                     ds = f['fields'][name]
@@ -205,7 +213,7 @@ class HDF5Dataset:
 
     def _batch_generator(self):
         """Yields (B, C, H, W) numpy arrays."""
-        indices = np.arange(self._n_samples)
+        indices = np.arange(self._sample_start, self._sample_stop)
         if self.shuffle:
             self._rng.shuffle(indices)
 
