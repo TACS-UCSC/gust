@@ -71,6 +71,9 @@ class SelfAttention2d(eqx.Module):
             x = self.norm(x)
 
         qkv = self.to_qkv(x)  # [3*C, H, W]
+        # Two-step reshape to avoid ShardingTypeError with multi-device
+        # (split channel axis first, then merge spatial axes)
+        qkv = jnp.reshape(qkv, (3, self.num_heads, self.head_dim, H, W))  # [3, heads, head_dim, H, W]
         qkv = jnp.reshape(qkv, (3, self.num_heads, self.head_dim, H * W))  # [3, heads, head_dim, N]
         q, k, v = qkv[0], qkv[1], qkv[2]  # each [heads, head_dim, N]
 
@@ -84,6 +87,9 @@ class SelfAttention2d(eqx.Module):
 
         out = jnp.matmul(attn, v)  # [heads, N, head_dim]
         out = jnp.transpose(out, (0, 2, 1))  # [heads, head_dim, N]
+        # Two-step reshape to avoid ShardingTypeError with multi-device
+        # (split spatial axis first, then merge head axes)
+        out = jnp.reshape(out, (self.num_heads, self.head_dim, H, W))  # [heads, head_dim, H, W]
         out = jnp.reshape(out, (C, H, W))
 
         out = self.to_out(out)
