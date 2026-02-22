@@ -29,6 +29,11 @@ Single `requirements.txt` at repo root. Install with `pip install -r requirement
 - Common HDF5 format: `/fields/{name}` as `(n_samples, H, W) float32`
 - JAX for array computing
 
+## VQ-VAE training (`models/`)
+
+- Gradient clipping: `optax.clip_by_global_norm(0.5)` is applied before AdamW in the optimizer chain (`train_vqvae.py`)
+- L2 normalization: encoder outputs and codebook vectors are L2-normalized before the distance computation in `_quantize_single` (`models.py`). This bounds commitment loss and prevents magnitude-driven spikes.
+
 ## Skills
 
 Always load the `jax` and `equinox` skills when working in this project.

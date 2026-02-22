@@ -12,6 +12,7 @@ import argparse
 
 import h5py
 import matplotlib
+from tqdm import tqdm
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
@@ -33,35 +34,45 @@ def main():
                              "If not set, derived from data.")
     args = parser.parse_args()
 
-    with h5py.File(args.input, "r") as h5f:
-        omega = h5f["fields/omega"][:]  # (n_samples, H, W)
-
-    n_frames = omega.shape[0]
-    print(f"Loaded {n_frames} frames of shape {omega.shape[1:]}")
+    h5f = h5py.File(args.input, "r")
+    dset = h5f["fields/omega"]  # (n_samples, H, W)
+    n_frames = dset.shape[0]
+    print(f"Streaming {n_frames} frames of shape {dset.shape[1:]} from disk")
 
     if args.vrange is not None:
         vmin, vmax = -args.vrange, args.vrange
     else:
-        abs_max = max(abs(float(omega.min())), abs(float(omega.max())))
+        # Sample a subset of frames to estimate color range without loading all
+        sample_idx = range(0, n_frames, max(1, n_frames // 20))
+        abs_max = 0.0
+        for i in sample_idx:
+            frame = dset[i]
+            abs_max = max(abs_max, abs(float(frame.min())),
+                          abs(float(frame.max())))
         vmin, vmax = -abs_max, abs_max
 
     fig, ax = plt.subplots()
-    img = ax.imshow(omega[0], origin="lower", cmap=args.cmap,
+    img = ax.imshow(dset[0], origin="lower", cmap=args.cmap,
                     vmin=vmin, vmax=vmax)
     fig.colorbar(img, ax=ax, label="vorticity")
     ax.set_title("frame 0")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
 
+    pbar = tqdm(total=n_frames, desc="Rendering", unit="frame")
+
     def update(frame_idx):
-        img.set_data(omega[frame_idx])
+        img.set_data(dset[frame_idx])
         ax.set_title(f"frame {frame_idx}")
+        pbar.update(1)
         return [img]
 
     anim = FuncAnimation(fig, update, frames=n_frames, blit=True)
     writer = FFMpegWriter(fps=args.fps)
     anim.save(args.output, writer=writer)
+    pbar.close()
     plt.close(fig)
+    h5f.close()
     print(f"Saved {args.output} ({n_frames} frames at {args.fps} fps)")
 
 

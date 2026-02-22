@@ -497,13 +497,13 @@ class MultiScaleQuantizer2d(eqx.Module):
         flatten = jnp.transpose(x, (1, 2, 0))  # [H, W, D]
         flatten = jnp.reshape(flatten, (-1, self.D))  # [H*W, D]
 
+        # L2-normalize before computing distances (stabilizes commitment loss)
+        flatten = flatten / (jnp.linalg.norm(flatten, axis=-1, keepdims=True) + 1e-8)
+        codebook = codebook / (jnp.linalg.norm(codebook, axis=-1, keepdims=True) + 1e-8)
+
         # Compute distances to codebook vectors
-        a_squared = jnp.sum(flatten**2, axis=-1, keepdims=True)
-        b_squared = jnp.transpose(jnp.sum(codebook**2, axis=-1, keepdims=True))
         distance = (
-            a_squared
-            + b_squared
-            - 2 * jnp.matmul(flatten, jnp.transpose(codebook))
+            2.0 - 2.0 * jnp.matmul(flatten, jnp.transpose(codebook))
         )
 
         # Find nearest codebook vectors

@@ -4,6 +4,7 @@ jax
 jaxlib
 scipy
 matplotlib
+tqdm
 dedalus>=3.0.2
 equinox
 optax
