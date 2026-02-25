@@ -4,6 +4,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import equinox as eqx
 import argparse
+import json
 import os
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,11 +34,14 @@ def parse_args():
     parser.add_argument("--commitment_weight", type=float, default=0.25, help="Commitment loss weight (beta)")
     parser.add_argument("--decay", type=float, default=0.99, help="EMA decay for codebook")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Checkpoint directory")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N epochs")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint in checkpoint_dir")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--normalize", action="store_true", help="Normalize data")
     parser.add_argument("--wandb_project", type=str, default="vqvae-turbulence", help="Wandb project name")
     parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
+    parser.add_argument("--wandb_id", type=str, default=None,
+                        help="Wandb run ID for resuming a run across jobs")
     # Scales
     parser.add_argument("--scales", type=str, default="1x1,2x2,4x4,8x8,16x16",
                         help="Comma-separated (h)x(w) scales (e.g. 1x1,2x2,4x4,8x8,16x16)")
@@ -98,18 +102,30 @@ def plot_codebook_usage(indices, vocab_size):
     return fig
 
 
-def save_checkpoint(model, opt_state, epoch, checkpoint_dir, wandb_dir=None):
-    """Save model checkpoint to checkpoint_dir and optionally to wandb dir."""
+def save_checkpoint(model, opt_state, epoch, global_step, checkpoint_dir, wandb_dir=None):
+    """Save model, optimizer state, and training state to checkpoint_dir.
+
+    Files are saved with fixed names and overwritten each epoch so only
+    the latest checkpoint is kept on disk.
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"vqvae_epoch_{epoch}.eqx")
-    eqx.tree_serialise_leaves(checkpoint_path, model)
-    print(f"Saved checkpoint to {checkpoint_path}")
+
+    model_path = os.path.join(checkpoint_dir, "checkpoint.eqx")
+    eqx.tree_serialise_leaves(model_path, model)
+
+    opt_path = os.path.join(checkpoint_dir, "opt_state.eqx")
+    eqx.tree_serialise_leaves(opt_path, opt_state)
+
+    state_path = os.path.join(checkpoint_dir, "training_state.json")
+    with open(state_path, "w") as f:
+        json.dump({"epoch": epoch, "global_step": global_step}, f)
+
+    print(f"Saved checkpoint (epoch {epoch}) to {checkpoint_dir}")
 
     if wandb_dir is not None:
         os.makedirs(wandb_dir, exist_ok=True)
-        wandb_path = os.path.join(wandb_dir, f"vqvae_epoch_{epoch}.eqx")
-        eqx.tree_serialise_leaves(wandb_path, model)
-        print(f"Saved checkpoint to {wandb_path}")
+        eqx.tree_serialise_leaves(os.path.join(wandb_dir, "checkpoint.eqx"), model)
+        eqx.tree_serialise_leaves(os.path.join(wandb_dir, "opt_state.eqx"), opt_state)
 
 
 def main():
@@ -215,6 +231,25 @@ def main():
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+    # Resume from checkpoint
+    start_epoch = 0
+    global_step = 0
+    if args.resume:
+        state_path = os.path.join(args.checkpoint_dir, "training_state.json")
+        model_path = os.path.join(args.checkpoint_dir, "checkpoint.eqx")
+        opt_path = os.path.join(args.checkpoint_dir, "opt_state.eqx")
+        if not all(os.path.exists(p) for p in [state_path, model_path, opt_path]):
+            raise FileNotFoundError(
+                f"Cannot resume: missing checkpoint files in {args.checkpoint_dir}"
+            )
+        with open(state_path) as f:
+            training_state = json.load(f)
+        start_epoch = training_state["epoch"]
+        global_step = training_state["global_step"]
+        model = eqx.tree_deserialise_leaves(model_path, model)
+        opt_state = eqx.tree_deserialise_leaves(opt_path, opt_state)
+        print(f"Resumed from epoch {start_epoch}, global step {global_step}")
+
     # Build config
     config = {
         "data_path": args.data_path,
@@ -244,11 +279,15 @@ def main():
 
     # Initialize wandb
     if WANDB_AVAILABLE:
-        wandb.init(
+        wandb_kwargs = dict(
             project=args.wandb_project,
             name=args.wandb_name,
-            config=config
+            config=config,
         )
+        if args.wandb_id is not None:
+            wandb_kwargs["id"] = args.wandb_id
+            wandb_kwargs["resume"] = "allow"
+        wandb.init(**wandb_kwargs)
 
     # Save config to checkpoint_dir and wandb run dir
     def write_config(path):
@@ -264,8 +303,7 @@ def main():
         write_config(os.path.join(wandb.run.dir, "config.txt"))
 
     # Training loop
-    global_step = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
         epoch_losses = []
@@ -331,14 +369,9 @@ def main():
             plt.close(recon_fig)
             plt.close(usage_fig)
 
-        # Save checkpoint
+        # Save checkpoint (overwrite each epoch)
         wandb_dir = wandb.run.dir if (WANDB_AVAILABLE and wandb.run is not None) else None
-        if (epoch + 1) % args.save_every == 0:
-            save_checkpoint(model, opt_state, epoch + 1, args.checkpoint_dir, wandb_dir)
-
-    # Save final checkpoint
-    wandb_dir = wandb.run.dir if (WANDB_AVAILABLE and wandb.run is not None) else None
-    save_checkpoint(model, opt_state, args.epochs, args.checkpoint_dir, wandb_dir)
+        save_checkpoint(model, opt_state, epoch + 1, global_step, args.checkpoint_dir, wandb_dir)
 
     if WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()

@@ -1,0 +1,85 @@
+#!/bin/bash
+#PBS -N gust_vqvae
+#PBS -A UCSC0009
+#PBS -q main
+#PBS -l select=1:ncpus=16:ngpus=4:mem=480GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -m abe
+
+# ---------- paths ----------
+REPODIR="${HOME}/gust"
+DATA_PATH="/glade/derecho/scratch/anishs/turb2d_long/output.h5"
+CHECKPOINT_DIR="/glade/derecho/scratch/anishs/test"
+
+# ---------- training parameters ----------
+BASE_CHANNELS=96
+CHANNEL_MULT="2,4,8,16"
+NUM_RES_BLOCKS=2
+SCALES="1x1,2x2,3x3,4x4,5x5,6x6,8x8,10x10,12x12,13x13,16x16"
+VOCAB_SIZE=512
+CODEBOOK_DIM=64
+COMMITMENT_WEIGHT=0.5
+EPOCHS=100
+BATCH_SIZE=64
+DECAY=0.85
+LR=4e-4
+SAMPLE_STOP=64000
+WANDB_PROJECT="gust-vqvae"
+
+# ---------- chaining support ----------
+# WANDB_ID is passed via qsub -v for multi-job run continuation.
+# Auto-detect resume: if a prior checkpoint exists, add --resume.
+RESUME_FLAG=""
+if [ -f "${CHECKPOINT_DIR}/training_state.json" ]; then
+    RESUME_FLAG="--resume"
+    echo "Found prior checkpoint – will resume training"
+fi
+
+WANDB_FLAGS=""
+if [ -n "${WANDB_ID}" ]; then
+    WANDB_FLAGS="--wandb_id ${WANDB_ID} --wandb_name ${WANDB_ID}"
+fi
+
+# ---------- setup ----------
+mkdir -p "${CHECKPOINT_DIR}"
+
+source /glade/derecho/scratch/anishs/gust-venv/bin/activate
+
+cd "${REPODIR}"
+
+echo "=========================================="
+echo "Job:      ${PBS_JOBID}"
+echo "Node:     $(hostname)"
+echo "Started:  $(date)"
+echo "GPUs:     $(nvidia-smi -L 2>/dev/null | wc -l)"
+echo "Data:     ${DATA_PATH}"
+echo "Samples:  0 - ${SAMPLE_STOP}"
+echo "Ckpt dir: ${CHECKPOINT_DIR}"
+echo "Wandb ID: ${WANDB_ID:-<new run>}"
+echo "Resume:   ${RESUME_FLAG:-no}"
+echo "=========================================="
+
+# ---------- run ----------
+python -m models.train_vqvae \
+    --data_path "${DATA_PATH}" \
+    --checkpoint_dir "${CHECKPOINT_DIR}" \
+    --base_channels ${BASE_CHANNELS} \
+    --channel_mult ${CHANNEL_MULT} \
+    --num_res_blocks ${NUM_RES_BLOCKS} \
+    --scales ${SCALES} \
+    --vocab_size ${VOCAB_SIZE} \
+    --codebook_dim ${CODEBOOK_DIM} \
+    --commitment_weight ${COMMITMENT_WEIGHT} \
+    --epochs ${EPOCHS} \
+    --batch_size ${BATCH_SIZE} \
+    --decay ${DECAY} \
+    --lr ${LR} \
+    --sample_stop ${SAMPLE_STOP} \
+    --wandb_project ${WANDB_PROJECT} \
+    ${RESUME_FLAG} \
+    ${WANDB_FLAGS}
+
+echo "=========================================="
+echo "Finished: $(date)"
+echo "=========================================="
