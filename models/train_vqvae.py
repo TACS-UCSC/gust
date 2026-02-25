@@ -248,6 +248,10 @@ def main():
         global_step = training_state["global_step"]
         model = eqx.tree_deserialise_leaves(model_path, model)
         opt_state = eqx.tree_deserialise_leaves(opt_path, opt_state)
+        # Replicate across devices so JIT can infer conv output shardings
+        replicated = NamedSharding(mesh, P())
+        model = jax.device_put(model, replicated)
+        opt_state = jax.device_put(opt_state, replicated)
         print(f"Resumed from epoch {start_epoch}, global step {global_step}")
 
     # Build config
