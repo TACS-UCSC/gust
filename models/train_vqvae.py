@@ -102,7 +102,8 @@ def plot_codebook_usage(indices, vocab_size):
     return fig
 
 
-def save_checkpoint(model, opt_state, epoch, global_step, checkpoint_dir, wandb_dir=None):
+def save_checkpoint(model, opt_state, epoch, global_step, checkpoint_dir,
+                    wandb_dir=None, arch_config=None):
     """Save model, optimizer state, and training state to checkpoint_dir.
 
     Files are saved with fixed names and overwritten each epoch so only
@@ -116,9 +117,12 @@ def save_checkpoint(model, opt_state, epoch, global_step, checkpoint_dir, wandb_
     opt_path = os.path.join(checkpoint_dir, "opt_state.eqx")
     eqx.tree_serialise_leaves(opt_path, opt_state)
 
+    state = {"epoch": epoch, "global_step": global_step}
+    if arch_config is not None:
+        state["arch_config"] = arch_config
     state_path = os.path.join(checkpoint_dir, "training_state.json")
     with open(state_path, "w") as f:
-        json.dump({"epoch": epoch, "global_step": global_step}, f)
+        json.dump(state, f)
 
     print(f"Saved checkpoint (epoch {epoch}) to {checkpoint_dir}")
 
@@ -177,6 +181,20 @@ def main():
     # Handle attention/norm flags
     use_attention = args.use_attention and not args.no_attention
     use_norm = args.use_norm and not args.no_norm
+
+    # Architecture config for checkpoint validation (JSON-safe types)
+    arch_config = {
+        "base_channels": args.base_channels,
+        "channel_mult": list(channel_mult),
+        "num_res_blocks": args.num_res_blocks,
+        "hidden_dim": args.hidden_dim,
+        "codebook_dim": args.codebook_dim,
+        "vocab_size": args.vocab_size,
+        "scales": [list(s) for s in scales],
+        "use_attention": use_attention,
+        "use_norm": use_norm,
+        "attention_heads": args.attention_heads,
+    }
 
     # Initialize model
     key, model_key = jax.random.split(key)
@@ -244,6 +262,28 @@ def main():
             )
         with open(state_path) as f:
             training_state = json.load(f)
+
+        # Validate architecture matches before loading weights
+        saved_arch = training_state.get("arch_config")
+        if saved_arch is not None:
+            mismatches = []
+            for k, current_val in arch_config.items():
+                saved_val = saved_arch.get(k)
+                if saved_val is not None and saved_val != current_val:
+                    mismatches.append(
+                        f"  {k}: checkpoint={saved_val}, current={current_val}"
+                    )
+            if mismatches:
+                raise ValueError(
+                    "Cannot resume: model architecture in checkpoint does not "
+                    "match current args:\n" + "\n".join(mismatches) +
+                    f"\nUse matching args or clear {args.checkpoint_dir} to "
+                    "start fresh."
+                )
+        else:
+            print("Warning: checkpoint has no saved arch config; "
+                  "skipping architecture validation")
+
         start_epoch = training_state["epoch"]
         global_step = training_state["global_step"]
         model = eqx.tree_deserialise_leaves(model_path, model)
@@ -375,7 +415,8 @@ def main():
 
         # Save checkpoint (overwrite each epoch)
         wandb_dir = wandb.run.dir if (WANDB_AVAILABLE and wandb.run is not None) else None
-        save_checkpoint(model, opt_state, epoch + 1, global_step, args.checkpoint_dir, wandb_dir)
+        save_checkpoint(model, opt_state, epoch + 1, global_step,
+                        args.checkpoint_dir, wandb_dir, arch_config=arch_config)
 
     if WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()
