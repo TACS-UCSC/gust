@@ -1,0 +1,100 @@
+#!/bin/bash
+#PBS -N gust_nsp
+#PBS -A UCSC0009
+#PBS -q main
+#PBS -l select=2:ncpus=16:ngpus=4:mem=480GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -m abe
+
+# ---------- paths ----------
+REPODIR="${HOME}/gust"
+TOKENS_PATH="/glade/derecho/scratch/anishs/tokens.npz"
+CHECKPOINT_DIR="/glade/derecho/scratch/anishs/checkpoints_nsp"
+
+# ---------- training parameters ----------
+N_LAYER=12
+N_HEAD=8
+N_EMBD=512
+OPTIMIZER="lion"
+LR=3e-4
+WEIGHT_DECAY=0.1
+GRAD_CLIP=1.0
+WARMUP_STEPS=200
+EPOCHS=200
+BATCH_SIZE=64
+SAVE_EVERY=5
+LOG_EVERY=10
+WANDB_PROJECT="gust-nsp"
+
+# ---------- NCCL over Slingshot ----------
+export NCCL_NET="AWS Libfabric"
+export NCCL_SOCKET_IFNAME=hsn
+export NCCL_CROSS_NIC=1
+export NCCL_NET_GDR_LEVEL=PHB
+export MPICH_GPU_SUPPORT_ENABLED=0
+
+# ---------- chaining support ----------
+# WANDB_ID is passed via qsub -v for multi-job run continuation.
+# Auto-detect resume: if a prior checkpoint exists, add --resume.
+RESUME_FLAG=""
+if [ -f "${CHECKPOINT_DIR}/training_state.json" ]; then
+    RESUME_FLAG="--resume"
+    echo "Found prior checkpoint – will resume training"
+fi
+
+WANDB_FLAGS=""
+if [ -n "${WANDB_ID}" ]; then
+    WANDB_FLAGS="--wandb_id ${WANDB_ID} --wandb_name ${WANDB_ID}"
+fi
+
+# ---------- setup ----------
+mkdir -p "${CHECKPOINT_DIR}"
+
+# Write wandb logs and temp files to scratch (not home, which has a small quota)
+export WANDB_DIR="/glade/derecho/scratch/anishs/wandb"
+export TMPDIR="/glade/derecho/scratch/anishs/tmp"
+mkdir -p "${WANDB_DIR}" "${TMPDIR}"
+
+source /glade/derecho/scratch/anishs/gust-venv/bin/activate
+
+cd "${REPODIR}"
+
+NNODES=$(cat "${PBS_NODEFILE}" | sort -u | wc -l)
+
+echo "=========================================="
+echo "Job:      ${PBS_JOBID}"
+echo "Nodes:    ${NNODES}"
+echo "Started:  $(date)"
+echo "GPUs:     $((NNODES * 4))"
+echo "Tokens:   ${TOKENS_PATH}"
+echo "Ckpt dir: ${CHECKPOINT_DIR}"
+echo "Wandb ID: ${WANDB_ID:-<new run>}"
+echo "Resume:   ${RESUME_FLAG:-no}"
+echo "=========================================="
+
+# ---------- run ----------
+# One MPI process per node; JAX sees all 4 GPUs on each node.
+mpiexec -n ${NNODES} --ppn 1 --cpu-bind none \
+    python -m models.train_nsp \
+    --tokens_path "${TOKENS_PATH}" \
+    --checkpoint_dir "${CHECKPOINT_DIR}" \
+    --n_layer ${N_LAYER} \
+    --n_head ${N_HEAD} \
+    --n_embd ${N_EMBD} \
+    --optimizer ${OPTIMIZER} \
+    --lr ${LR} \
+    --weight_decay ${WEIGHT_DECAY} \
+    --grad_clip ${GRAD_CLIP} \
+    --warmup_steps ${WARMUP_STEPS} \
+    --epochs ${EPOCHS} \
+    --batch_size ${BATCH_SIZE} \
+    --save_every ${SAVE_EVERY} \
+    --log_every ${LOG_EVERY} \
+    --wandb_project ${WANDB_PROJECT} \
+    ${RESUME_FLAG} \
+    ${WANDB_FLAGS}
+
+echo "=========================================="
+echo "Finished: $(date)"
+echo "=========================================="

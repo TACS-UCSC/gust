@@ -66,6 +66,39 @@ python -m models.analyze_reconstruction \
 - Outputs loglog spectral plots (GT vs Reconstruction), histogram plot, and `metrics.json` with MSE, JS divergence, and TV distance
 - Supports `--sample_start`/`--sample_stop` for train/test splits and all model architecture overrides
 
+## NSP training (`models/train_nsp.py`)
+
+Autoregressive Next-Scale Prediction model that predicts t1 frames conditioned on t0 using block-causal attention across scales.
+
+```bash
+python -m models.train_nsp --tokens_path tokens.npz
+```
+
+- Input: tokenized `.npz` from `models.tokenizer save`
+- Architecture: pre-norm transformer with per-scale prediction heads and SwiGLU MLP
+- Scales stored as `(h, w)` tuples matching Gust tokenizer format
+- `first_trainable_scale` auto-detected from tokenizer (deterministic scales skipped)
+- Multi-device data-parallel via `set_mesh` auto-sharding; codebook gather is at batch level (outside vmap) so replicated codebook + batch-sharded indices resolves cleanly
+- Multi-node: `_maybe_init_distributed()` tries mpi4py, falls back to manual PBS_NODEFILE parsing; no-op on single-node
+- Checkpointing: model `.eqx` + `opt_state.eqx` + `training_state.json` with architecture validation on resume; only process 0 saves
+- Optimizer choices: `--optimizer lion/adamw/adafactor` with warmup cosine decay
+- wandb project default: `gust-nsp`, supports `--wandb_id` for cross-job resume
+- Logging/wandb/checkpoint I/O guarded to `jax.process_index() == 0`
+
+**Derecho HPC (2 nodes / 8 A100s):**
+
+```bash
+# Single job
+qsub scripts/derecho_train_nsp.pbs
+
+# Chained jobs (auto-resume + shared wandb run)
+./scripts/chain_submit.sh scripts/derecho_train_nsp.pbs 3
+```
+
+- PBS script uses `mpiexec -n $NNODES --ppn 1 --cpu-bind none` (1 process/node, JAX sees 4 GPUs/node)
+- NCCL over Slingshot: `NCCL_NET="AWS Libfabric"`, `NCCL_SOCKET_IFNAME=hsn`, `NCCL_CROSS_NIC=1`, `NCCL_NET_GDR_LEVEL=PHB`
+- Requires `mpi4py` installed with cray-mpich module loaded
+
 ## Skills
 
 Always load the `jax` and `equinox` skills when working in this project.
