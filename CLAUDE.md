@@ -78,7 +78,8 @@ python -m models.train_nsp --tokens_path tokens.npz
 - Architecture: pre-norm transformer with per-scale prediction heads and SwiGLU MLP
 - Scales stored as `(h, w)` tuples matching Gust tokenizer format
 - `first_trainable_scale` auto-detected from tokenizer (deterministic scales skipped)
-- Multi-device data-parallel via `set_mesh` auto-sharding; codebook gather is at batch level (outside vmap) so replicated codebook + batch-sharded indices resolves cleanly
+- Multi-device data-parallel via `eqx.filter_pmap` + `lax.pmean`; single GPU uses `filter_jit` (no pmap overhead)
+- Each device has a full model copy; codebook gather is purely local (no sharding annotations)
 - Multi-node: `_maybe_init_distributed()` tries mpi4py, falls back to manual PBS_NODEFILE parsing; no-op on single-node
 - Checkpointing: model `.eqx` + `opt_state.eqx` + `training_state.json` with architecture validation on resume; only process 0 saves
 - Optimizer choices: `--optimizer lion/adamw/adafactor` with warmup cosine decay

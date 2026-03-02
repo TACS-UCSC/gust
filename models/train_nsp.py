@@ -4,6 +4,9 @@ Training script for Autoregressive Next-Scale Prediction (NSP).
 Trains the model to predict t1 given t0 (context) and coarser scales of t1.
 Data is loaded as pairs [t0, t1].
 
+Single-GPU: standard filter_jit.
+Multi-GPU:  filter_pmap with lax.pmean for data-parallel gradient averaging.
+
 Usage:
     python -m models.train_nsp --tokens_path tokens.npz
 """
@@ -15,7 +18,6 @@ import socket
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
 import equinox as eqx
 import optax
 import numpy as np
@@ -109,8 +111,7 @@ def parse_args():
 
 
 def create_paired_dataloader(data: np.ndarray, batch_size: int,
-                             shuffle: bool = True, seed: int = 0,
-                             sharding=None):
+                             shuffle: bool = True, seed: int = 0):
     """Yield batches of [B, 2 * tokens_per_frame] by pairing consecutive frames.
 
     Args:
@@ -118,7 +119,6 @@ def create_paired_dataloader(data: np.ndarray, batch_size: int,
         batch_size: Number of pairs per batch
         shuffle: Whether to shuffle pair indices
         seed: Random seed for shuffling
-        sharding: Optional JAX sharding for device_put
     """
     n_samples = len(data) - 1  # Need pairs
     indices = np.arange(n_samples)
@@ -133,15 +133,16 @@ def create_paired_dataloader(data: np.ndarray, batch_size: int,
         t0 = data[batch_indices]
         t1 = data[batch_indices + 1]
 
-        batch = jnp.array(np.concatenate([t0, t1], axis=1))
-        if sharding is not None:
-            batch = jax.device_put(batch, sharding)
-        yield batch
+        yield jnp.array(np.concatenate([t0, t1], axis=1))
 
 
 def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
-                    attn_bias: jax.Array):
-    """Create JIT-compiled train step for t1 prediction at a specific scale."""
+                    attn_bias: jax.Array, total_devices: int = 1):
+    """Create train step for t1 prediction at a specific scale.
+
+    Returns a filter_jit'd function for single GPU, or a filter_pmap'd
+    function (with lax.pmean gradient averaging) for multi-GPU.
+    """
 
     boundaries = config.scale_boundaries
     padded_len = config.padded_seq_len
@@ -157,52 +158,67 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
     t1_offset = padded_len
     mask_positions = mask_positions.at[t1_offset + scale_start : t1_offset + config.tokens_per_frame].set(True)
 
-    @eqx.filter_jit
-    def step(model, opt_state, batch_tokens, optimizer):
-        # batch_tokens: [B, 2*tokens_per_frame] (unpadded)
+    def compute_loss(model, batch_tokens):
+        """Forward pass — shared between single-GPU and multi-GPU paths."""
+        t0 = batch_tokens[:, :config.tokens_per_frame]
+        t1 = batch_tokens[:, config.tokens_per_frame:]
 
-        def loss_fn(model):
-            B = batch_tokens.shape[0]
+        t0_pad = jnp.pad(t0, ((0, 0), (0, padded_len - config.tokens_per_frame)))
+        t1_pad = jnp.pad(t1, ((0, 0), (0, padded_len - config.tokens_per_frame)))
 
-            t0 = batch_tokens[:, :config.tokens_per_frame]
-            t1 = batch_tokens[:, config.tokens_per_frame:]
+        tokens_in = jnp.concatenate([t0_pad, t1_pad], axis=1)
 
-            t0_pad = jnp.pad(t0, ((0, 0), (0, padded_len - config.tokens_per_frame)))
-            t1_pad = jnp.pad(t1, ((0, 0), (0, padded_len - config.tokens_per_frame)))
+        # Codebook lookup at batch level (outside vmap)
+        codebook = jax.lax.stop_gradient(model.embedding.codebook)
+        token_vecs = codebook[tokens_in]  # [B, 2*padded_len, D]
 
-            tokens_in = jnp.concatenate([t0_pad, t1_pad], axis=1)
+        hidden = jax.vmap(
+            lambda t, v: model(t, mask_positions, attn_bias, token_vectors=v)
+        )(tokens_in, token_vecs)
 
-            # Codebook lookup at batch level (outside vmap) to avoid
-            # gather sharding ambiguity with batch-sharded indices.
-            codebook = jax.lax.stop_gradient(model.embedding.codebook)
-            token_vecs = codebook[tokens_in]  # [B, 2*padded_len, D]
+        h_scale = hidden[:, t1_offset + scale_start : t1_offset + scale_end, :]
 
-            hidden = jax.vmap(
-                lambda t, v: model(t, mask_positions, attn_bias, token_vectors=v)
-            )(tokens_in, token_vecs)
+        logits = jax.vmap(jax.vmap(model.scale_heads[head_idx]))(h_scale)
 
-            h_scale = hidden[:, t1_offset + scale_start : t1_offset + scale_end, :]
+        targets = t1[:, scale_start:scale_end] - offset
 
-            logits = jax.vmap(jax.vmap(model.scale_heads[head_idx]))(h_scale)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        target_log_probs = jnp.take_along_axis(
+            log_probs, targets[:, :, None], axis=-1
+        ).squeeze(-1)
 
-            targets = t1[:, scale_start:scale_end] - offset
+        loss = -jnp.mean(target_log_probs)
 
-            log_probs = jax.nn.log_softmax(logits, axis=-1)
-            target_log_probs = jnp.take_along_axis(
-                log_probs, targets[:, :, None], axis=-1
-            ).squeeze(-1)
+        preds = jnp.argmax(logits, axis=-1)
+        accuracy = jnp.mean(preds == targets)
 
-            loss = -jnp.mean(target_log_probs)
+        return loss, accuracy
 
-            preds = jnp.argmax(logits, axis=-1)
-            accuracy = jnp.mean(preds == targets)
-
-            return loss, accuracy
-
-        (loss, accuracy), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
-        updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
-        model = eqx.apply_updates(model, updates)
-        return model, opt_state, loss, accuracy
+    if total_devices > 1:
+        # Multi-GPU: pmap over devices, pmean to sync gradients
+        @eqx.filter_pmap(in_axes=(0, 0, 0, None), axis_name="batch")
+        def step(model, opt_state, batch_tokens, optimizer):
+            (loss, accuracy), grads = eqx.filter_value_and_grad(
+                lambda m: compute_loss(m, batch_tokens), has_aux=True
+            )(model)
+            grads = jax.lax.pmean(grads, "batch")
+            loss = jax.lax.pmean(loss, "batch")
+            accuracy = jax.lax.pmean(accuracy, "batch")
+            updates, opt_state = optimizer.update(
+                grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+            model = eqx.apply_updates(model, updates)
+            return model, opt_state, loss, accuracy
+    else:
+        # Single GPU: standard JIT
+        @eqx.filter_jit
+        def step(model, opt_state, batch_tokens, optimizer):
+            (loss, accuracy), grads = eqx.filter_value_and_grad(
+                lambda m: compute_loss(m, batch_tokens), has_aux=True
+            )(model)
+            updates, opt_state = optimizer.update(
+                grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+            model = eqx.apply_updates(model, updates)
+            return model, opt_state, loss, accuracy
 
     return step
 
@@ -233,23 +249,23 @@ def main():
     _maybe_init_distributed()
     key = jax.random.PRNGKey(args.seed)
 
-    # Multi-device setup with global auto-sharding.  The codebook gather
-    # is at batch level (outside vmap), so replicated codebook + batch-
-    # sharded indices resolves cleanly under set_mesh.
-    num_devices = jax.device_count()
-    mesh = jax.make_mesh((num_devices,), ("batch",))
-    jax.sharding.set_mesh(mesh)
+    # Device topology
+    num_local = jax.local_device_count()
+    num_processes = jax.process_count()
+    total_devices = num_local * num_processes
     is_main = jax.process_index() == 0
-    if is_main:
-        print(f"Using {num_devices} device(s)")
+    multi_device = total_devices > 1
 
-    if args.batch_size % num_devices != 0:
+    if is_main:
+        print(f"Using {total_devices} device(s)"
+              + (f" ({num_processes} process(es) x {num_local} local)"
+                 if num_processes > 1 else ""))
+
+    if args.batch_size % total_devices != 0:
         raise ValueError(
             f"Batch size ({args.batch_size}) must be divisible by "
-            f"number of devices ({num_devices})"
+            f"number of devices ({total_devices})"
         )
-
-    data_sharding = NamedSharding(mesh, P("batch", None))
 
     # Load tokenized data
     if is_main:
@@ -289,9 +305,8 @@ def main():
         "scale_offsets": list(config.scale_offsets),
     }
 
-    # Build attention mask and replicate across devices
+    # Build attention mask
     attn_bias = build_temporal_mask(config.scales, config.padded_seq_len)
-    attn_bias = jax.device_put(attn_bias, NamedSharding(mesh, P()))
     if is_main:
         print(f"Temporal mask shape: {attn_bias.shape}")
 
@@ -301,7 +316,8 @@ def main():
         print(f"Trainable scales: {[config.scales[i] for i in trainable_indices]}")
     train_steps = {}
     for scale_idx in trainable_indices:
-        train_steps[scale_idx] = make_train_step(config, scale_idx, attn_bias)
+        train_steps[scale_idx] = make_train_step(
+            config, scale_idx, attn_bias, total_devices)
 
     # Optimizer
     n_samples = len(indices) - 1
@@ -337,11 +353,6 @@ def main():
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
-
-    # Replicate model and optimizer state across devices
-    replicated = NamedSharding(mesh, P())
-    model = jax.device_put(model, replicated)
-    opt_state = jax.device_put(opt_state, replicated)
 
     # Resume from checkpoint
     start_epoch = 0
@@ -383,13 +394,14 @@ def main():
         global_step = training_state["global_step"]
         model = eqx.tree_deserialise_leaves(model_path, model)
         opt_state = eqx.tree_deserialise_leaves(opt_path, opt_state)
-
-        # Replicate across devices
-        replicated = NamedSharding(mesh, P())
-        model = jax.device_put(model, replicated)
-        opt_state = jax.device_put(opt_state, replicated)
         if is_main:
             print(f"Resumed from epoch {start_epoch}, global step {global_step}")
+
+    # Replicate model and optimizer state across local devices for pmap
+    if multi_device:
+        devices = jax.local_devices()
+        model = jax.device_put_replicated(model, devices)
+        opt_state = jax.device_put_replicated(opt_state, devices)
 
     # Initialize wandb (main process only)
     if WANDB_AVAILABLE and is_main:
@@ -419,10 +431,17 @@ def main():
 
         dataloader = create_paired_dataloader(
             indices, args.batch_size, seed=int(loader_key[0]),
-            sharding=data_sharding,
         )
 
         for batch_idx, batch in enumerate(dataloader):
+            # For multi-device: each process takes its shard, then
+            # reshape for pmap across local devices
+            if multi_device:
+                per_process = args.batch_size // num_processes
+                start = jax.process_index() * per_process
+                batch = batch[start : start + per_process]
+                batch = batch.reshape(num_local, -1, batch.shape[-1])
+
             # Sample a random trainable scale
             key, sk = jax.random.split(key)
             target_idx = trainable_indices[int(jax.random.randint(sk, (), 0, len(trainable_indices)))]
@@ -430,6 +449,10 @@ def main():
             model, opt_state, loss, acc = train_steps[target_idx](
                 model, opt_state, batch, optimizer
             )
+
+            # pmap returns per-device values; take [0] (all identical after pmean)
+            if multi_device:
+                loss, acc = loss[0], acc[0]
 
             per_scale_accs[target_idx].append(float(acc))
             epoch_losses.append(float(loss))
@@ -469,12 +492,17 @@ def main():
             wandb.log(epoch_log)
 
         if is_main and (epoch + 1) % args.save_every == 0:
-            save_checkpoint(model, opt_state, epoch + 1, global_step,
+            # Extract single-device copy for serialization
+            save_model = jax.tree.map(lambda x: x[0], model) if multi_device else model
+            save_opt = jax.tree.map(lambda x: x[0], opt_state) if multi_device else opt_state
+            save_checkpoint(save_model, save_opt, epoch + 1, global_step,
                             args.checkpoint_dir, arch_config=arch_config)
 
     # Final Save
     if is_main:
-        save_checkpoint(model, opt_state, args.epochs, global_step,
+        save_model = jax.tree.map(lambda x: x[0], model) if multi_device else model
+        save_opt = jax.tree.map(lambda x: x[0], opt_state) if multi_device else opt_state
+        save_checkpoint(save_model, save_opt, args.epochs, global_step,
                         args.checkpoint_dir, arch_config=arch_config)
 
     if WANDB_AVAILABLE and is_main and wandb.run is not None:
