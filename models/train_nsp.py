@@ -4,6 +4,16 @@ Training script for Autoregressive Next-Scale Prediction (NSP).
 Trains the model to predict t1 given t0 (context) and coarser scales of t1.
 Data is loaded as pairs [t0, t1].
 
+Optimizer uses optax.multi_transform for per-head state isolation:
+- Trunk (backbone) params get a standard optimizer chain
+- Each scale head gets a skip_on_zero_grads wrapper that freezes optimizer
+  state when the head is inactive (not the target scale for a given step)
+
+Optimizer choices: muon (default), lion, adamw, adafactor.
+Muon (Momentum + Newton-Schulz orthogonalization) applies NS iterations to
+orthogonalize momentum for 2D weight matrices and falls back to AdamW for
+non-matrix params (embeddings, biases, layer norms).
+
 Single-GPU: standard filter_jit.
 Multi-GPU:  filter_pmap with lax.pmean for data-parallel gradient averaging.
 
@@ -81,14 +91,16 @@ def parse_args():
     # Training
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate (Lion needs lower LR than AdamW)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate (default: 0.02 for muon, 1e-4 for others)")
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--optimizer", type=str, default="lion",
-                        choices=["adamw", "lion", "adafactor"],
-                        help="Optimizer to use (default: lion)")
+    parser.add_argument("--optimizer", type=str, default="muon",
+                        choices=["muon", "adamw", "lion", "adafactor"],
+                        help="Optimizer to use (default: muon)")
+    parser.add_argument("--muon_ns_steps", type=int, default=5,
+                        help="Newton-Schulz iterations for Muon optimizer")
     # Model
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--n_head", type=int, default=8)
@@ -135,6 +147,52 @@ def create_paired_dataloader(data: np.ndarray, batch_size: int,
 
         yield jnp.array(np.concatenate([t0, t1], axis=1))
 
+
+# =============================================================================
+# Per-head optimizer isolation
+# =============================================================================
+
+def build_param_labels(model):
+    """Label params: 'trunk' for backbone, 'head_i' for each scale head."""
+    params = eqx.filter(model, eqx.is_inexact_array)
+
+    def _label(path, _leaf):
+        for j, key in enumerate(path):
+            if (isinstance(key, jax.tree_util.GetAttrKey)
+                    and key.name == 'scale_heads'
+                    and j + 1 < len(path)):
+                next_key = path[j + 1]
+                return f"head_{next_key.idx}"
+        return "trunk"
+
+    return jax.tree_util.tree_map_with_path(_label, params)
+
+
+def skip_on_zero_grads(inner):
+    """Skip optimizer state update when grads are all zeros (inactive head).
+
+    When a scale head is not the target for a training step, its gradients
+    are None (filled to zeros for optax compatibility). This wrapper detects
+    exact-zero gradient norm and returns zero updates with unchanged state,
+    preventing momentum/EMA corruption from zero-grad steps.
+    """
+    def init_fn(params):
+        return inner.init(params)
+
+    def update_fn(updates, state, params=None):
+        grad_norm = optax.global_norm(updates)
+        return jax.lax.cond(
+            grad_norm > 0,
+            lambda: inner.update(updates, state, params),
+            lambda: (jax.tree.map(jnp.zeros_like, updates), state),
+        )
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+# =============================================================================
+# Train step
+# =============================================================================
 
 def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
                     attn_bias: jax.Array, total_devices: int = 1):
@@ -194,14 +252,6 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
 
         return loss, accuracy
 
-    def _zero_none_grads(grads, model):
-        """Replace None gradients (from unused scale heads) with zeros."""
-        params = eqx.filter(model, eqx.is_inexact_array)
-        return jax.tree_util.tree_map(
-            lambda g, p: jnp.zeros_like(p) if g is None and p is not None else g,
-            grads, params, is_leaf=lambda x: x is None,
-        )
-
     if total_devices > 1:
         # Multi-GPU: pmap over devices, pmean to sync gradients
         @eqx.filter_pmap(in_axes=(0, 0, 0, None), axis_name="batch")
@@ -209,12 +259,27 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
             (loss, accuracy), grads = eqx.filter_value_and_grad(
                 lambda m: compute_loss(m, batch_tokens), has_aux=True
             )(model)
-            grads = _zero_none_grads(grads, model)
-            grads = jax.lax.pmean(grads, "batch")
+
+            params = eqx.filter(model, eqx.is_inexact_array)
+
+            # Fill None grads with zeros (required for optax tree traversal)
+            safe_grads = jax.tree.map(
+                lambda g, p: jnp.zeros_like(p) if (g is None and p is not None) else g,
+                grads, params, is_leaf=lambda x: x is None,
+            )
+
+            safe_grads = jax.lax.pmean(safe_grads, "batch")
             loss = jax.lax.pmean(loss, "batch")
             accuracy = jax.lax.pmean(accuracy, "batch")
-            params = eqx.filter(model, eqx.is_inexact_array)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
+
+            updates, opt_state = optimizer.update(safe_grads, opt_state, params)
+
+            # Mask updates to None where original grads were None
+            updates = jax.tree.map(
+                lambda g, u: None if g is None else u,
+                grads, updates, is_leaf=lambda x: x is None,
+            )
+
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss, accuracy
     else:
@@ -224,9 +289,24 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
             (loss, accuracy), grads = eqx.filter_value_and_grad(
                 lambda m: compute_loss(m, batch_tokens), has_aux=True
             )(model)
-            grads = _zero_none_grads(grads, model)
+
             params = eqx.filter(model, eqx.is_inexact_array)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
+
+            # Fill None grads with zeros (required for optax tree traversal)
+            # FIX: Only call zeros_like if p is an actual array (not None)
+            safe_grads = jax.tree.map(
+                lambda g, p: jnp.zeros_like(p) if (g is None and p is not None) else g,
+                grads, params, is_leaf=lambda x: x is None,
+            )
+
+            updates, opt_state = optimizer.update(safe_grads, opt_state, params)
+
+            # Mask updates to None where original grads were None
+            updates = jax.tree.map(
+                lambda g, u: None if g is None else u,
+                grads, updates, is_leaf=lambda x: x is None,
+            )
+
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss, accuracy
 
@@ -329,38 +409,61 @@ def main():
         train_steps[scale_idx] = make_train_step(
             config, scale_idx, attn_bias, total_devices)
 
-    # Optimizer
+    # Optimizer — multi_transform with per-head isolation
     n_samples = len(indices) - 1
     steps_per_epoch = n_samples // args.batch_size
     total_steps = steps_per_epoch * args.epochs
+
+    # Per-optimizer default learning rate
+    if args.lr is None:
+        args.lr = 0.02 if args.optimizer == "muon" else 1e-4
 
     schedule = optax.warmup_cosine_decay_schedule(
         0.0, args.lr, args.warmup_steps, total_steps, args.lr * 0.01
     )
 
-    if args.optimizer == "lion":
+    if args.optimizer == "muon":
+        if is_main:
+            print(f"Using Muon optimizer (lr={args.lr}, ns_steps={args.muon_ns_steps})")
+        base_opt = optax.chain(
+            optax.clip_by_global_norm(args.grad_clip),
+            optax.contrib.muon(
+                learning_rate=schedule,
+                weight_decay=args.weight_decay,
+                ns_steps=args.muon_ns_steps,
+            )
+        )
+    elif args.optimizer == "lion":
         if is_main:
             print(f"Using Lion optimizer (lr={args.lr})")
-        optimizer = optax.chain(
+        base_opt = optax.chain(
             optax.clip_by_global_norm(args.grad_clip),
             optax.lion(learning_rate=schedule, weight_decay=args.weight_decay)
         )
     elif args.optimizer == "adamw":
         if is_main:
             print(f"Using AdamW optimizer (lr={args.lr})")
-        optimizer = optax.chain(
+        base_opt = optax.chain(
             optax.clip_by_global_norm(args.grad_clip),
             optax.adamw(schedule, weight_decay=args.weight_decay)
         )
     elif args.optimizer == "adafactor":
         if is_main:
             print(f"Using Adafactor optimizer")
-        optimizer = optax.chain(
+        base_opt = optax.chain(
             optax.clip_by_global_norm(args.grad_clip),
             optax.adafactor(learning_rate=schedule)
         )
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
+
+    # Build multi_transform: trunk gets base_opt, each head gets skip_on_zero_grads
+    transforms = {"trunk": base_opt}
+    for i in range(config.n_trainable_scales):
+        transforms[f"head_{i}"] = skip_on_zero_grads(base_opt)
+
+    labels = build_param_labels(model)
+    optimizer = optax.multi_transform(transforms, build_param_labels)
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
@@ -409,9 +512,15 @@ def main():
 
     # Replicate model and optimizer state across local devices for pmap
     if multi_device:
-        devices = jax.local_devices()
-        model = jax.device_put_replicated(model, devices)
-        opt_state = jax.device_put_replicated(opt_state, devices)
+        # Explicitly add the num_local dimension for pmap
+        model = jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (num_local,) + x.shape), 
+            model
+        )
+        opt_state = jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (num_local,) + x.shape), 
+            opt_state
+        )
 
     # Initialize wandb (main process only)
     if WANDB_AVAILABLE and is_main:

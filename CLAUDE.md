@@ -82,7 +82,9 @@ python -m models.train_nsp --tokens_path tokens.npz
 - Each device has a full model copy; codebook gather is purely local (no sharding annotations)
 - Multi-node: `_maybe_init_distributed()` tries mpi4py, falls back to manual PBS_NODEFILE parsing; no-op on single-node
 - Checkpointing: model `.eqx` + `opt_state.eqx` + `training_state.json` with architecture validation on resume; only process 0 saves
-- Optimizer choices: `--optimizer lion/adamw/adafactor` with warmup cosine decay
+- Optimizer: `optax.multi_transform` with per-head isolation — trunk gets `chain(clip_by_global_norm, optimizer)`, each scale head gets `skip_on_zero_grads(base_opt)` wrapper that freezes optimizer state when the head is inactive
+- `build_param_labels()` labels params as `'trunk'` or `'head_i'` for multi_transform routing
+- Optimizer choices: `--optimizer muon/lion/adamw/adafactor` with warmup cosine decay (default: muon, uses ~100x higher LR; `--muon_ns_steps` controls Newton-Schulz iterations)
 - wandb project default: `gust-nsp`, supports `--wandb_id` for cross-job resume
 - Logging/wandb/checkpoint I/O guarded to `jax.process_index() == 0`
 
