@@ -194,6 +194,14 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
 
         return loss, accuracy
 
+    def _zero_none_grads(grads, model):
+        """Replace None gradients (from unused scale heads) with zeros."""
+        params = eqx.filter(model, eqx.is_inexact_array)
+        return jax.tree_util.tree_map(
+            lambda g, p: jnp.zeros_like(p) if g is None and p is not None else g,
+            grads, params, is_leaf=lambda x: x is None,
+        )
+
     if total_devices > 1:
         # Multi-GPU: pmap over devices, pmean to sync gradients
         @eqx.filter_pmap(in_axes=(0, 0, 0, None), axis_name="batch")
@@ -201,11 +209,12 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
             (loss, accuracy), grads = eqx.filter_value_and_grad(
                 lambda m: compute_loss(m, batch_tokens), has_aux=True
             )(model)
+            grads = _zero_none_grads(grads, model)
             grads = jax.lax.pmean(grads, "batch")
             loss = jax.lax.pmean(loss, "batch")
             accuracy = jax.lax.pmean(accuracy, "batch")
-            updates, opt_state = optimizer.update(
-                grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+            params = eqx.filter(model, eqx.is_inexact_array)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss, accuracy
     else:
@@ -215,8 +224,9 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
             (loss, accuracy), grads = eqx.filter_value_and_grad(
                 lambda m: compute_loss(m, batch_tokens), has_aux=True
             )(model)
-            updates, opt_state = optimizer.update(
-                grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+            grads = _zero_none_grads(grads, model)
+            params = eqx.filter(model, eqx.is_inexact_array)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
             model = eqx.apply_updates(model, updates)
             return model, opt_state, loss, accuracy
 
