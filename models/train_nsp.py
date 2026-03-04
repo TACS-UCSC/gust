@@ -106,6 +106,8 @@ def parse_args():
     parser.add_argument("--n_head", type=int, default=8)
     parser.add_argument("--n_embd", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--rope_theta", type=float, default=16.0,
+                        help="Base frequency for 2D axial RoPE (default: 16.0)")
     # Logging
     parser.add_argument("--wandb_project", type=str, default="gust-nsp")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -195,7 +197,8 @@ def skip_on_zero_grads(inner):
 # =============================================================================
 
 def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
-                    attn_bias: jax.Array, total_devices: int = 1):
+                    attn_bias: jax.Array, scale_weight: float = 1.0,
+                    total_devices: int = 1):
     """Create train step for t1 prediction at a specific scale.
 
     Returns a filter_jit'd function for single GPU, or a filter_pmap'd
@@ -245,7 +248,8 @@ def make_train_step(config: NextScalePredConfig, target_scale_idx: int,
             log_probs, targets[:, :, None], axis=-1
         ).squeeze(-1)
 
-        loss = -jnp.mean(target_log_probs)
+        raw_loss = -jnp.mean(target_log_probs)
+        loss = raw_loss * scale_weight
 
         preds = jnp.argmax(logits, axis=-1)
         accuracy = jnp.mean(preds == targets)
@@ -375,6 +379,7 @@ def main():
         n_head=args.n_head,
         n_embd=args.n_embd,
         dropout=args.dropout,
+        rope_theta=args.rope_theta,
     )
 
     # Populate data-derived fields
@@ -393,6 +398,7 @@ def main():
         "first_trainable_scale": config.first_trainable_scale,
         "scale_vocab_sizes": list(config.scale_vocab_sizes),
         "scale_offsets": list(config.scale_offsets),
+        "rope_theta": config.rope_theta,
     }
 
     # Build attention mask
@@ -404,10 +410,23 @@ def main():
     trainable_indices = config.trainable_scale_indices
     if is_main:
         print(f"Trainable scales: {[config.scales[i] for i in trainable_indices]}")
+
+    # Per-scale loss weights: inversely proportional to token count, mean-normalized to 1
+    token_counts = [config.scales[i][0] * config.scales[i][1] for i in trainable_indices]
+    inv_counts = [1.0 / c for c in token_counts]
+    mean_inv = sum(inv_counts) / len(inv_counts)
+    scale_weights = {idx: inv / mean_inv for idx, inv in zip(trainable_indices, inv_counts)}
+    if is_main:
+        for idx, w in scale_weights.items():
+            h, w_s = config.scales[idx]
+            print(f"  Scale {h}x{w_s} ({h*w_s} tokens): loss weight = {w:.3f}")
+
     train_steps = {}
     for scale_idx in trainable_indices:
         train_steps[scale_idx] = make_train_step(
-            config, scale_idx, attn_bias, total_devices)
+            config, scale_idx, attn_bias,
+            scale_weight=scale_weights[scale_idx],
+            total_devices=total_devices)
 
     # Optimizer — multi_transform with per-head isolation
     n_samples = len(indices) - 1

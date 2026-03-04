@@ -5,7 +5,7 @@ jaxlib
 scipy
 matplotlib
 tqdm
-dedalus>=3.0.2
+# dedalus>=3.0.2  # not necessary for now
 equinox
 optax
 wandb

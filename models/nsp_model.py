@@ -32,6 +32,7 @@ class NextScalePredConfig:
     n_embd: int = 256
     dropout: float = 0.0
     bias: bool = True
+    rope_theta: float = 16.0
 
     codebook_dim: int = 32
     unified_vocab_size: int = 399
@@ -158,6 +159,90 @@ def get_scale_ids(scales: tuple, padded_len: int) -> jnp.ndarray:
     return scale_ids
 
 
+def build_rope_coords(scales: tuple, padded_len: int) -> jnp.ndarray:
+    """Map each token position to cell-center coordinates on the finest grid.
+
+    For scale (h, w), token at raster position (i, j) maps to:
+        row = i * (max_h / h) + (max_h / h / 2)
+        col = j * (max_w / w) + (max_w / w / 2)
+
+    Returns: [padded_len, 2] float32 (padding positions get (0, 0)).
+    """
+    max_h = max(h for h, w in scales)
+    max_w = max(w for h, w in scales)  # square grids, but keep general
+
+    coords = []
+    for h, w in scales:
+        step_h = max_h / h
+        step_w = max_w / w
+        for i in range(h):
+            for j in range(w):
+                coords.append((i * step_h + step_h / 2,
+                                j * step_w + step_w / 2))
+
+    # Pad to padded_len
+    while len(coords) < padded_len:
+        coords.append((0.0, 0.0))
+
+    return jnp.array(coords, dtype=jnp.float32)  # [padded_len, 2]
+
+
+def apply_axial_rope(q, k, coords, theta: float = 16.0):
+    """Apply 2D axial RoPE to Q and K tensors.
+
+    Args:
+        q, k: [T, n_head, head_dim]
+        coords: [T, 2] — (row, col) coordinates per token
+        theta: base frequency
+
+    Returns:
+        Rotated (q, k), same shapes.
+    """
+    T, n_head, head_dim = q.shape
+    d = head_dim // 4  # frequency bands per axis
+
+    inv_freq = 1.0 / (theta ** (jnp.arange(d, dtype=jnp.float32) / d))  # [d]
+
+    row = coords[:, 0]  # [T]
+    col = coords[:, 1]  # [T]
+
+    # Outer products: [T, d]
+    row_angles = row[:, None] * inv_freq[None, :]
+    col_angles = col[:, None] * inv_freq[None, :]
+
+    # Build cos/sin for full head_dim:
+    # first half (head_dim//2) = row rotation, second half = col rotation
+    # Each half: d freqs * 2 dims per rotation pair = head_dim//2
+    cos_row = jnp.cos(row_angles)  # [T, d]
+    sin_row = jnp.sin(row_angles)  # [T, d]
+    cos_col = jnp.cos(col_angles)  # [T, d]
+    sin_col = jnp.sin(col_angles)  # [T, d]
+
+    # Interleave to match rotate_half: repeat each freq for the pair
+    cos_row = jnp.repeat(cos_row, 2, axis=-1)  # [T, head_dim//2]
+    sin_row = jnp.repeat(sin_row, 2, axis=-1)
+    cos_col = jnp.repeat(cos_col, 2, axis=-1)
+    sin_col = jnp.repeat(sin_col, 2, axis=-1)
+
+    # Full cos/sin: [T, head_dim]
+    cos = jnp.concatenate([cos_row, cos_col], axis=-1)  # [T, head_dim]
+    sin = jnp.concatenate([sin_row, sin_col], axis=-1)
+
+    # Broadcast to heads: [T, 1, head_dim]
+    cos = cos[:, None, :]
+    sin = sin[:, None, :]
+
+    def _rotate_half(x):
+        # x: [T, n_head, head_dim]
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return jnp.stack((-x2, x1), axis=-1).reshape(x.shape)
+
+    q_rot = q * cos + _rotate_half(q) * sin
+    k_rot = k * cos + _rotate_half(k) * sin
+    return q_rot, k_rot
+
+
 # =============================================================================
 # Embedding Module
 # =============================================================================
@@ -167,13 +252,14 @@ class NextScaleEmbedding(eqx.Module):
 
     Embeds [t0, t1] sequence with:
     1. Codebook vectors
-    2. Positional embeddings (repeated for t0 and t1)
-    3. Scale embeddings (repeated for t0 and t1)
-    4. Frame embeddings (0 for t0, 1 for t1)
+    2. Scale embeddings (repeated for t0 and t1)
+    3. Frame embeddings (0 for t0, 1 for t1)
+
+    Position information is provided by 2D axial RoPE applied in each
+    attention layer (not here).
     """
     codebook: jax.Array               # [unified_vocab_size, codebook_dim]
     codebook_proj: eqx.nn.Linear      # codebook_dim -> n_embd
-    pos_embed: eqx.nn.Embedding       # [tokens_per_frame, n_embd]
     scale_embed: eqx.nn.Embedding     # [n_scales, n_embd]
     frame_embed: eqx.nn.Embedding     # [2, n_embd]
     mask_token: jax.Array             # [n_embd]
@@ -182,22 +268,19 @@ class NextScaleEmbedding(eqx.Module):
 
     def __init__(self, config: NextScalePredConfig, codebook: jax.Array, key):
         self._config = config
-        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
 
         self.codebook = codebook
         self.codebook_proj = eqx.nn.Linear(
             config.codebook_dim, config.n_embd, use_bias=config.bias, key=k1
         )
-        self.pos_embed = eqx.nn.Embedding(
-            config.tokens_per_frame, config.n_embd, key=k2
-        )
         self.scale_embed = eqx.nn.Embedding(
-            config.n_scales, config.n_embd, key=k3
+            config.n_scales, config.n_embd, key=k2
         )
         self.frame_embed = eqx.nn.Embedding(
-            2, config.n_embd, key=k4
+            2, config.n_embd, key=k3
         )
-        self.mask_token = jax.random.normal(k5, (config.n_embd,)) * 0.02
+        self.mask_token = jax.random.normal(k4, (config.n_embd,)) * 0.02
 
     def __call__(self, tokens: jax.Array, mask_positions: jax.Array,
                  token_vectors: Optional[jax.Array] = None) -> jax.Array:
@@ -212,7 +295,6 @@ class NextScaleEmbedding(eqx.Module):
         """
         total_len = tokens.shape[0]
         padded_len = total_len // 2
-        tpf = self._config.tokens_per_frame
 
         # 1. Token Embeddings
         if token_vectors is not None:
@@ -224,25 +306,20 @@ class NextScaleEmbedding(eqx.Module):
         # Masking (only affects t1 targets)
         tok_emb = jnp.where(mask_positions[:, None], self.mask_token[None, :], tok_emb)
 
-        # 2. Positional Embedding (Repeat [0..tpf-1] for t0 and t1)
-        raw_positions = jnp.arange(padded_len) % tpf
-        positions = jnp.concatenate([raw_positions, raw_positions])
-        pos_emb = jax.vmap(self.pos_embed)(positions)
-
-        # 3. Scale Embedding (Repeat)
+        # 2. Scale Embedding (Repeat)
         scale_ids_single = get_scale_ids(self._config.scales, padded_len)
         scale_ids = jnp.concatenate([scale_ids_single, scale_ids_single])
         scale_ids_clamped = jnp.minimum(scale_ids, self._config.n_scales - 1)
         scale_emb = jax.vmap(self.scale_embed)(scale_ids_clamped)
 
-        # 4. Frame Embedding (0 for t0, 1 for t1)
+        # 3. Frame Embedding (0 for t0, 1 for t1)
         frame_ids = jnp.concatenate([
             jnp.zeros(padded_len, dtype=jnp.int32),
             jnp.ones(padded_len, dtype=jnp.int32)
         ])
         frame_emb = jax.vmap(self.frame_embed)(frame_ids)
 
-        return tok_emb + pos_emb + scale_emb + frame_emb
+        return tok_emb + scale_emb + frame_emb
 
 
 # =============================================================================
@@ -272,7 +349,7 @@ class BlockCausalAttention(eqx.Module):
         self.resid_dropout = eqx.nn.Dropout(config.dropout)
         self._config = config
 
-    def __call__(self, x, attn_bias, *, key=None):
+    def __call__(self, x, attn_bias, rope_coords, *, key=None):
         T, C = x.shape
         n_head = self._config.n_head
         head_dim = C // n_head
@@ -283,6 +360,8 @@ class BlockCausalAttention(eqx.Module):
         q = q.reshape(T, n_head, head_dim)
         k = k.reshape(T, n_head, head_dim)
         v = v.reshape(T, n_head, head_dim)
+
+        q, k = apply_axial_rope(q, k, rope_coords, theta=self._config.rope_theta)
 
         q_bf16 = q.astype(jnp.bfloat16)
         k_bf16 = k.astype(jnp.bfloat16)
@@ -342,12 +421,12 @@ class Block(eqx.Module):
         self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
         self.mlp = MLP(config, k2)
 
-    def __call__(self, x, attn_bias, *, key=None):
+    def __call__(self, x, attn_bias, rope_coords, *, key=None):
         if key is not None:
             k1, k2 = jax.random.split(key)
         else:
             k1 = k2 = None
-        x = x + self.attn(jax.vmap(self.ln_1)(x), attn_bias, key=k1)
+        x = x + self.attn(jax.vmap(self.ln_1)(x), attn_bias, rope_coords, key=k1)
         x = x + self.mlp(jax.vmap(self.ln_2)(x), key=k2)
         return x
 
@@ -385,13 +464,10 @@ class NextScalePredictor(eqx.Module):
             )
         print(f"NextScalePredictor: {self.get_num_params()/1e6:.2f}M parameters")
 
-    def get_num_params(self, non_embedding: bool = True) -> int:
-        n_params = sum(
+    def get_num_params(self) -> int:
+        return sum(
             x.size for x in jax.tree_util.tree_leaves(eqx.filter(self, eqx.is_array))
         )
-        if non_embedding:
-            n_params -= self.embedding.pos_embed.weight.size
-        return n_params
 
     def __call__(self, tokens: jax.Array, mask_positions: jax.Array,
                  attn_bias: jax.Array, token_vectors: Optional[jax.Array] = None,
@@ -404,17 +480,22 @@ class NextScalePredictor(eqx.Module):
             token_vectors: Optional [2 * padded_len, codebook_dim] pre-looked-up
                 vectors (pass to avoid gather inside vmap with sharded batches)
         """
+        config = self._config
         x = self.embedding(tokens, mask_positions, token_vectors=token_vectors)
         if key is not None:
             key, drop_key = jax.random.split(key)
             x = self.drop(x, key=drop_key)
+
+        # Build RoPE coords: same for t0 and t1 (duplicate single-frame coords)
+        single_coords = build_rope_coords(config.scales, config.padded_seq_len)
+        rope_coords = jnp.concatenate([single_coords, single_coords], axis=0)
 
         for block in self.blocks:
             if key is not None:
                 key, block_key = jax.random.split(key)
             else:
                 block_key = None
-            x = eqx.filter_checkpoint(block)(x, attn_bias, key=block_key)
+            x = eqx.filter_checkpoint(block)(x, attn_bias, rope_coords, key=block_key)
 
         x = jax.vmap(self.ln_f)(x)
         return x

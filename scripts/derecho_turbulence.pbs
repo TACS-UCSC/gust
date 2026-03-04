@@ -1,0 +1,59 @@
+#!/bin/bash
+#PBS -N gust_turb2d
+#PBS -A UCSC0009
+#PBS -q main
+#PBS -l select=1:ncpus=4:ngpus=1:mem=120GB
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m abe
+
+# ---------- paths ----------
+REPODIR="${HOME}/gust"
+OUTDIR="${SCRATCH}/gust/turb2d_output"
+
+IC_FILE="/glade/derecho/scratch/asheshc/beta-channel-turbulence/data_lowres/13327.mat"
+
+# ---------- simulation parameters ----------
+RE=10000
+NX=256
+DT=1e-4
+T_TOTAL=15.0          # 150,000 timesteps at dt=1e-4
+T_SAVE=1e-2           # save every 100 steps → 1,500 snapshots
+BETA=20.0
+ALPHA=0.1
+FKX=4
+FKY=4
+
+# ---------- setup ----------
+mkdir -p "${OUTDIR}"
+
+source /glade/derecho/scratch/anishs/gust-venv/bin/activate
+
+cd "${REPODIR}"
+
+echo "=========================================="
+echo "Job:      ${PBS_JOBID}"
+echo "Node:     $(hostname)"
+echo "Started:  $(date)"
+echo "IC file:  ${IC_FILE}"
+echo "NX=${NX}  Re=${RE}  beta=${BETA}  dt=${DT}  tTotal=${T_TOTAL}  tSave=${T_SAVE}"
+echo "Output:   ${OUTDIR}"
+echo "=========================================="
+
+# ---------- run ----------
+python -m solvers.py2d_turbulence.run_solver \
+    --output_dir "${OUTDIR}" \
+    --Re ${RE} \
+    --NX ${NX} \
+    --dt ${DT} \
+    --tTotal ${T_TOTAL} \
+    --tSave ${T_SAVE} \
+    --fkx ${FKX} \
+    --fky ${FKY} \
+    --beta ${BETA} \
+    --alpha ${ALPHA} \
+    --ic_file "${IC_FILE}"
+
+echo "=========================================="
+echo "Finished: $(date)"
+echo "=========================================="
