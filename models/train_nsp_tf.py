@@ -115,6 +115,8 @@ def parse_args():
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from latest checkpoint")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Use only the first N frames (default: all)")
     return parser.parse_args()
 
 
@@ -563,6 +565,8 @@ def main():
         print(f"Loading data from {args.tokens_path}...")
     token_data = load_tokenized_data(args.tokens_path)
     indices = token_data["indices_flat"]
+    if args.max_samples is not None:
+        indices = indices[:args.max_samples]
     scales = token_data["scales"]
     tokens_per_frame = sum(h * w for h, w in scales)
 

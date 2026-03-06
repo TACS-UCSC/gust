@@ -139,8 +139,8 @@ def compute_pixel_metrics(hist_data):
     }
 
 
-def plot_pixel_histograms(hist_data, output_path):
-    """Plot overlaid step histograms for GT vs Reconstruction."""
+def plot_pixel_histograms(hist_data, output_path, pred_label="Reconstruction"):
+    """Plot overlaid step histograms for GT vs Reconstruction/Prediction."""
     fig, ax = plt.subplots(figsize=(10, 6))
     bin_centers = hist_data["bin_centers"]
 
@@ -150,7 +150,7 @@ def plot_pixel_histograms(hist_data, output_path):
     )
     ax.step(
         bin_centers, hist_data["recon_hist"], where="mid",
-        label="Reconstruction", color="green", linewidth=2, alpha=0.8,
+        label=pred_label, color="green", linewidth=2, alpha=0.8,
     )
 
     ax.set_xlabel("Pixel Value (Vorticity)", fontsize=12)
@@ -170,14 +170,15 @@ def plot_pixel_histograms(hist_data, output_path):
 # ---------------------------------------------------------------------------
 
 
-def plot_spectral_comparison(k_centers, gt_spec, recon_spec, spectrum_type, ylabel, output_path):
+def plot_spectral_comparison(k_centers, gt_spec, recon_spec, spectrum_type, ylabel, output_path,
+                             pred_label="Reconstruction"):
     """Plot sample-averaged spectral comparison (loglog)."""
     fig, ax = plt.subplots(figsize=(8, 6))
     valid_k = k_centers > 0
 
     for spec, label, color, ls in [
         (gt_spec, "Ground Truth", "blue", "-"),
-        (recon_spec, "Reconstruction", "green", "--"),
+        (recon_spec, pred_label, "green", "--"),
     ]:
         mask = valid_k & (spec > 0)
         if np.any(mask):
