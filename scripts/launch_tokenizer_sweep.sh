@@ -14,43 +14,43 @@ set -euo pipefail
 DRY_RUN=false
 NJOBS=3
 
-ALL_CONFIGS="regular-S regular-M light-S light-M full-S full-M"
+ALL_CONFIGS="unnormed-regular-S unnormed-regular-M unnormed-light-S unnormed-light-M unnormed-full-S unnormed-full-M"
 
 # ---------- Config definitions ----------
 config_vars() {
     local name="$1"
     case "${name}" in
-        regular-S)
+        unnormed-regular-S)
             echo "SCALES=1x1,2x2,4x4,8x8,16x16"
             echo "BASE_CHANNELS=64"
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
-        regular-M)
+        unnormed-regular-M)
             echo "SCALES=1x1,2x2,4x4,8x8,16x16"
             echo "BASE_CHANNELS=80"
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
-        light-S)
+        unnormed-light-S)
             echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
             echo "BASE_CHANNELS=64"
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
-        light-M)
+        unnormed-light-M)
             echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
             echo "BASE_CHANNELS=80"
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
-        full-S)
+        unnormed-full-S)
             echo "SCALES=1x1,2x2,3x3,4x4,5x5,6x6,8x8,10x10,12x12,13x13,16x16"
             echo "BASE_CHANNELS=64"
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
-        full-M)
+        unnormed-full-M)
             echo "SCALES=1x1,2x2,3x3,4x4,5x5,6x6,8x8,10x10,12x12,13x13,16x16"
             echo "BASE_CHANNELS=80"
             echo "CHANNEL_MULT=2,4,8,16"
@@ -246,7 +246,7 @@ list_configs() {
     echo "  M         base_channels=80, channel_mult=2,4,8,16, num_res_blocks=2"
     echo ""
     echo "Run names:"
-    echo "  regular-S  regular-M  light-S  light-M  full-S  full-M"
+    echo "  unnormed-regular-S  unnormed-regular-M  unnormed-light-S  unnormed-light-M  unnormed-full-S  unnormed-full-M"
 }
 
 # ---------- Usage ----------
