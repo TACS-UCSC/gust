@@ -497,25 +497,22 @@ class MultiScaleQuantizer2d(eqx.Module):
         flatten = jnp.transpose(x, (1, 2, 0))  # [H, W, D]
         flatten = jnp.reshape(flatten, (-1, self.D))  # [H*W, D]
 
-        # L2-normalize copies for cosine distance (keeps originals for straight-through)
-        flatten_norm = flatten / (jnp.linalg.norm(flatten, axis=-1, keepdims=True) + 1e-8)
-        codebook_norm = codebook / (jnp.linalg.norm(codebook, axis=-1, keepdims=True) + 1e-8)
+        # L2-normalize before computing distances (stabilizes commitment loss)
+        flatten = flatten / (jnp.linalg.norm(flatten, axis=-1, keepdims=True) + 1e-8)
+        codebook = codebook / (jnp.linalg.norm(codebook, axis=-1, keepdims=True) + 1e-8)
 
-        # Compute cosine distances for nearest-neighbor lookup
+        # Compute distances to codebook vectors
         distance = (
-            2.0 - 2.0 * jnp.matmul(flatten_norm, jnp.transpose(codebook_norm))
+            2.0 - 2.0 * jnp.matmul(flatten, jnp.transpose(codebook))
         )
 
-        # Find nearest codebook vectors (looked up from original codebook)
+        # Find nearest codebook vectors
         codebook_indices = jnp.argmin(distance, axis=-1)  # [H*W]
         # Use one-hot matmul instead of fancy indexing for multi-device sharding
         z_q = jax.nn.one_hot(codebook_indices, codebook.shape[0]) @ codebook  # [H*W, D]
 
-        # Straight-through estimator (passes original-magnitude encoder output)
+        # Straight-through estimator
         z_q = flatten + jax.lax.stop_gradient(z_q - flatten)
-        # # Unit-norm straight-through (toggle: uncomment below, comment above)
-        # z_q_norm = jax.nn.one_hot(codebook_indices, codebook_norm.shape[0]) @ codebook_norm
-        # z_q = flatten_norm + jax.lax.stop_gradient(z_q_norm - flatten_norm)
 
         # Reshape back: [H*W, D] -> [D, H, W]
         z_q = jnp.reshape(z_q, (H, W, self.D))  # [H, W, D]
