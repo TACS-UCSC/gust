@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run name")
     parser.add_argument("--wandb_id", type=str, default=None,
                         help="Wandb run ID for resuming a run across jobs")
+    parser.add_argument("--wandb_group", type=str, default=None,
+                        help="Wandb group for organizing sweep runs")
     # Scales
     parser.add_argument("--scales", type=str, default="1x1,2x2,4x4,8x8,16x16",
                         help="Comma-separated (h)x(w) scales (e.g. 1x1,2x2,4x4,8x8,16x16)")
@@ -331,6 +333,8 @@ def main():
         if args.wandb_id is not None:
             wandb_kwargs["id"] = args.wandb_id
             wandb_kwargs["resume"] = "allow"
+        if args.wandb_group is not None:
+            wandb_kwargs["group"] = args.wandb_group
         wandb.init(**wandb_kwargs)
 
     # Save config to checkpoint_dir and wandb run dir

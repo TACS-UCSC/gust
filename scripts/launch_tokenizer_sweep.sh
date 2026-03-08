@@ -14,7 +14,9 @@ set -euo pipefail
 DRY_RUN=false
 NJOBS=3
 
-ALL_CONFIGS="regular-S regular-M light-S light-M full-S full-M"
+SCALE_CONFIGS="regular-S regular-M light-S light-M full-S full-M"
+CODEBOOK_CONFIGS="cb-V128 cb-V256 cb-V1024 cb-D70 cb-D95 cb-D99 cb-CD32 cb-CD128"
+ALL_CONFIGS="${SCALE_CONFIGS} ${CODEBOOK_CONFIGS}"
 
 # ---------- Config definitions ----------
 config_vars() {
@@ -56,6 +58,72 @@ config_vars() {
             echo "CHANNEL_MULT=2,4,8,16"
             echo "NUM_RES_BLOCKS=2"
             ;;
+        # ===== Codebook sweep (light-M base) =====
+        cb-V128)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=128"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-V256)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=256"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-V1024)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=1024"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-D70)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "DECAY=0.70"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-D95)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "DECAY=0.95"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-D99)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "DECAY=0.99"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-CD32)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "CODEBOOK_DIM=32"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+        cb-CD128)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "CODEBOOK_DIM=128"
+            echo "WANDB_GROUP=codebook-sweep"
+            ;;
+
         *)
             echo "ERROR: Unknown config '${name}'" >&2
             return 1
@@ -71,15 +139,21 @@ submit_config() {
 
     # Extract per-config values
     local scales base_channels channel_mult num_res_blocks
+    local config_vocab_size config_codebook_dim config_decay config_wandb_group
     scales="$(echo "${vars}" | grep '^SCALES=' | cut -d= -f2-)"
     base_channels="$(echo "${vars}" | grep '^BASE_CHANNELS=' | cut -d= -f2-)"
     channel_mult="$(echo "${vars}" | grep '^CHANNEL_MULT=' | cut -d= -f2-)"
     num_res_blocks="$(echo "${vars}" | grep '^NUM_RES_BLOCKS=' | cut -d= -f2-)"
+    config_vocab_size="$(echo "${vars}" | grep '^VOCAB_SIZE=' | cut -d= -f2- || true)"
+    config_codebook_dim="$(echo "${vars}" | grep '^CODEBOOK_DIM=' | cut -d= -f2- || true)"
+    config_decay="$(echo "${vars}" | grep '^DECAY=' | cut -d= -f2- || true)"
+    config_wandb_group="$(echo "${vars}" | grep '^WANDB_GROUP=' | cut -d= -f2- || true)"
 
-    # Non-swept defaults
-    local vocab_size=512
-    local codebook_dim=64
-    local decay=0.85
+    # Non-swept defaults (overridable per config)
+    local vocab_size="${config_vocab_size:-512}"
+    local codebook_dim="${config_codebook_dim:-64}"
+    local decay="${config_decay:-0.85}"
+    local wandb_group="${config_wandb_group:-}"
     local lr=4e-4
     local commitment_weight=0.5
     local batch_size=64
@@ -105,7 +179,7 @@ submit_config() {
 # ---------- paths ----------
 REPODIR="\${HOME}/gust"
 DATA_PATH="\${DATA_PATH:-/glade/derecho/scratch/anishs/turb2d_long/output.h5}"
-SWEEP_BASE="\${SWEEP_BASE:-/glade/derecho/scratch/anishs/tokenizer-sweep}"
+SWEEP_BASE="\${SWEEP_BASE:-/glade/derecho/scratch/anishs/${wandb_group:-tokenizer-sweep}}"
 CHECKPOINT_DIR="\${SWEEP_BASE}/${name}"
 
 # ---------- training parameters ----------
@@ -137,6 +211,8 @@ WANDB_FLAGS=""
 if [ -n "\${WANDB_ID:-}" ]; then
     WANDB_FLAGS="--wandb_id \${WANDB_ID} --wandb_name \${WANDB_ID}"
 fi
+
+WANDB_GROUP_FLAG="${wandb_group:+--wandb_group ${wandb_group}}"
 
 # ---------- setup ----------
 mkdir -p "\${CHECKPOINT_DIR}"
@@ -193,7 +269,8 @@ python -m models.train_vqvae \\
     --sample_stop \${SAMPLE_STOP} \\
     --wandb_project \${WANDB_PROJECT} \\
     \${RESUME_FLAG} \\
-    \${WANDB_FLAGS}
+    \${WANDB_FLAGS} \\
+    \${WANDB_GROUP_FLAG}
 
 echo "=========================================="
 echo "Finished: \$(date)"
@@ -234,7 +311,7 @@ PBSEOF
 
 # ---------- List configs ----------
 list_configs() {
-    echo "Tokenizer sweep: 3 scale configs x 2 channel configs = 6 runs"
+    echo "Scale sweep: 3 scale configs x 2 channel configs = 6 runs"
     echo ""
     echo "Scale configs:"
     echo "  regular   1x1,2x2,4x4,8x8,16x16                                    (5 scales)"
@@ -247,6 +324,16 @@ list_configs() {
     echo ""
     echo "Run names:"
     echo "  regular-S  regular-M  light-S  light-M  full-S  full-M"
+    echo ""
+    echo "Codebook sweep (light-M base, group=codebook-sweep): 8 runs"
+    echo "  cb-V128   vocab_size=128"
+    echo "  cb-V256   vocab_size=256"
+    echo "  cb-V1024  vocab_size=1024"
+    echo "  cb-D70    decay=0.70"
+    echo "  cb-D95    decay=0.95"
+    echo "  cb-D99    decay=0.99"
+    echo "  cb-CD32   codebook_dim=32"
+    echo "  cb-CD128  codebook_dim=128"
 }
 
 # ---------- Usage ----------
@@ -258,13 +345,15 @@ usage() {
     echo "  --jobs N       Number of chained jobs per config (default: 3)"
     echo "  --list         List all available configurations"
     echo ""
-    echo "If no configs specified, submits all 6."
+    echo "If no configs specified, submits all scale configs."
+    echo "Groups: scales, codebook, all"
     echo ""
     echo "Examples:"
-    echo "  $0                              Submit all 6 configs (3 chained jobs each)"
+    echo "  $0                              Submit all scale configs (3 chained jobs each)"
+    echo "  $0 codebook                     Submit all codebook sweep configs"
     echo "  $0 regular-S light-M            Submit specific configs"
     echo "  $0 --jobs 5 regular-S           Override chain length"
-    echo "  $0 --dry-run                    Print without submitting"
+    echo "  $0 --dry-run codebook           Dry-run codebook sweep"
 }
 
 # ---------- Main ----------
@@ -287,6 +376,21 @@ while [ $# -gt 0 ]; do
             usage
             exit 0
             ;;
+        scales)
+            read -ra _tmp <<< "${SCALE_CONFIGS}"
+            CONFIGS+=("${_tmp[@]}")
+            shift
+            ;;
+        codebook)
+            read -ra _tmp <<< "${CODEBOOK_CONFIGS}"
+            CONFIGS+=("${_tmp[@]}")
+            shift
+            ;;
+        all)
+            read -ra _tmp <<< "${ALL_CONFIGS}"
+            CONFIGS+=("${_tmp[@]}")
+            shift
+            ;;
         *)
             CONFIGS+=("$1")
             shift
@@ -294,9 +398,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Default: all configs
+# Default: scale configs only
 if [ ${#CONFIGS[@]} -eq 0 ]; then
-    read -ra CONFIGS <<< "${ALL_CONFIGS}"
+    read -ra CONFIGS <<< "${SCALE_CONFIGS}"
 fi
 
 echo "=========================================="
