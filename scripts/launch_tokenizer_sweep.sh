@@ -16,7 +16,8 @@ NJOBS=3
 
 SCALE_CONFIGS="regular-S regular-M light-S light-M full-S full-M"
 CODEBOOK_CONFIGS="cb-V128 cb-V256 cb-V1024 cb-D70 cb-D95 cb-D99 cb-CD32 cb-CD128"
-ALL_CONFIGS="${SCALE_CONFIGS} ${CODEBOOK_CONFIGS}"
+VOCAB_CONFIGS="S-V512 S-V1024 S-V2048 M-V512 M-V1024 M-V2048"
+ALL_CONFIGS="${SCALE_CONFIGS} ${CODEBOOK_CONFIGS} ${VOCAB_CONFIGS}"
 
 # ---------- Config definitions ----------
 config_vars() {
@@ -122,6 +123,56 @@ config_vars() {
             echo "NUM_RES_BLOCKS=2"
             echo "CODEBOOK_DIM=128"
             echo "WANDB_GROUP=codebook-sweep"
+            ;;
+
+        # ===== Vocab x channels sweep (light scales) =====
+        S-V512)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=64"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=512"
+            echo "WANDB_GROUP=vocab-sweep"
+            ;;
+        S-V1024)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=64"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=1024"
+            echo "WANDB_GROUP=vocab-sweep"
+            ;;
+        S-V2048)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=64"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=2048"
+            echo "WANDB_GROUP=vocab-sweep"
+            ;;
+        M-V512)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=512"
+            echo "WANDB_GROUP=vocab-sweep"
+            ;;
+        M-V1024)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=1024"
+            echo "WANDB_GROUP=vocab-sweep"
+            ;;
+        M-V2048)
+            echo "SCALES=1x1,2x2,3x3,4x4,6x6,8x8,12x12,16x16"
+            echo "BASE_CHANNELS=80"
+            echo "CHANNEL_MULT=2,4,8,16"
+            echo "NUM_RES_BLOCKS=2"
+            echo "VOCAB_SIZE=2048"
+            echo "WANDB_GROUP=vocab-sweep"
             ;;
 
         *)
@@ -334,6 +385,14 @@ list_configs() {
     echo "  cb-D99    decay=0.99"
     echo "  cb-CD32   codebook_dim=32"
     echo "  cb-CD128  codebook_dim=128"
+    echo ""
+    echo "Vocab x channels sweep (light scales, group=vocab-sweep): 6 runs"
+    echo "  S-V512    base_channels=64, vocab_size=512"
+    echo "  S-V1024   base_channels=64, vocab_size=1024"
+    echo "  S-V2048   base_channels=64, vocab_size=2048"
+    echo "  M-V512    base_channels=80, vocab_size=512"
+    echo "  M-V1024   base_channels=80, vocab_size=1024"
+    echo "  M-V2048   base_channels=80, vocab_size=2048"
 }
 
 # ---------- Usage ----------
@@ -346,7 +405,7 @@ usage() {
     echo "  --list         List all available configurations"
     echo ""
     echo "If no configs specified, submits all scale configs."
-    echo "Groups: scales, codebook, all"
+    echo "Groups: scales, codebook, vocab, all"
     echo ""
     echo "Examples:"
     echo "  $0                              Submit all scale configs (3 chained jobs each)"
@@ -383,6 +442,11 @@ while [ $# -gt 0 ]; do
             ;;
         codebook)
             read -ra _tmp <<< "${CODEBOOK_CONFIGS}"
+            CONFIGS+=("${_tmp[@]}")
+            shift
+            ;;
+        vocab)
+            read -ra _tmp <<< "${VOCAB_CONFIGS}"
             CONFIGS+=("${_tmp[@]}")
             shift
             ;;
